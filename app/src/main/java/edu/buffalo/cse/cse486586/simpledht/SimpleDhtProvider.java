@@ -17,6 +17,7 @@ import android.content.ContentProvider;
 import android.content.ContentValues;
 import android.content.Context;
 import android.database.Cursor;
+import android.database.sqlite.SQLiteDatabase;
 import android.net.Uri;
 import android.os.AsyncTask;
 import android.telephony.TelephonyManager;
@@ -36,6 +37,9 @@ public class SimpleDhtProvider extends ContentProvider {
     public static String SUCCESSOR_NODE;
     public static String SUCCESSOR_NODE_HASH;
 
+
+    SimpleDhtDbHelper mDbHelper;
+
     @Override
     public int delete(Uri uri, String selection, String[] selectionArgs) {
         // TODO Auto-generated method stub
@@ -50,12 +54,15 @@ public class SimpleDhtProvider extends ContentProvider {
 
     @Override
     public Uri insert(Uri uri, ContentValues values) {
-        // TODO Auto-generated method stub
+        SQLiteDatabase db = mDbHelper.getWritableDatabase();
+        long newRowId = db.replace(SimpleDhtContract.KeyValueEntry.TABLE_NAME, null, mDbHelper.formatToSqlContentValues(values));
+        Log.v("insert", values.toString());
         return null;
     }
 
     @Override
     public boolean onCreate() {
+        mDbHelper = new SimpleDhtDbHelper(getContext());
         Context context = getContext();
         TelephonyManager tel = (TelephonyManager) getContext().getSystemService(Context.TELEPHONY_SERVICE);
         String portStr = tel.getLine1Number().substring(tel.getLine1Number().length() - 4);
@@ -63,11 +70,6 @@ public class SimpleDhtProvider extends ContentProvider {
         Log.d(TAG, "Current node is: " + CURRENT_NODE);
 
         CURRENT_NODE_HASH = genHash(String.valueOf(Integer.valueOf(CURRENT_NODE) / 2));
-
-
-//        mySQLiteOpenHelper = new MySQLiteOpenHelper(context, DB_NAME, null, DB_VERSION);
-//        db = mySQLiteOpenHelper.getWritableDatabase();
-
 
         // new a ServerTask()
         try {
@@ -85,7 +87,30 @@ public class SimpleDhtProvider extends ContentProvider {
     @Override
     public Cursor query(Uri uri, String[] projection, String selection, String[] selectionArgs,
                         String sortOrder) {
-        // TODO Auto-generated method stub
+        String alteredProjection[] = {
+                "key_string AS key",
+                "value_string AS value"
+
+        };
+
+        String alteredSelectionArgs[] = {
+                selection
+        };
+
+        String alteredSelection = "key_string = ?";
+
+        SQLiteDatabase db = mDbHelper.getReadableDatabase();
+        Cursor cursor = db.query(
+                SimpleDhtContract.KeyValueEntry.TABLE_NAME,   // The table to query
+                alteredProjection,// The array of columns to return (pass null to get all)
+                alteredSelection,              // The columns for the WHERE clause
+                alteredSelectionArgs,          // The values for the WHERE clause
+                null,                   // don't group the rows
+                null,                   // don't filter by row groups
+                sortOrder               // The sort order
+        );
+
+        Log.v("query", selection);
         return null;
     }
 
@@ -114,6 +139,13 @@ public class SimpleDhtProvider extends ContentProvider {
         new ClientAsyncTask(SUCCESSOR_NODE, receivedMessage, Util.MessageType.MESSAGE_TYPE_JOIN_CHORD).executeOnExecutor(AsyncTask.SERIAL_EXECUTOR);
     }
 
+    public static void informRequestingPortOfSuccess(String requestingPort, String predecessorPort, String successorPort) {
+        new ClientAsyncTask(requestingPort, Util.createJoinChordSuccessMessage(predecessorPort, successorPort), Util.MessageType.MESSAGE_TYPE_JOIN_CHORD_SUCCESS).executeOnExecutor(AsyncTask.SERIAL_EXECUTOR);
+    }
+
+    public static void informPriorPredecessorPortOfUpdate(String priorPredecessorPort, String requestingPort) {
+        new ClientAsyncTask(priorPredecessorPort, Util.createPredecessorUpdateMessage(requestingPort), Util.MessageType.MESSAGE_TYPE_PREDECESSOR_UPDATE).executeOnExecutor(AsyncTask.SERIAL_EXECUTOR);
+    }
 
     public static class JoinChordAsyncTask extends AsyncTask<Void, Void, Void> {
         @Override
@@ -172,6 +204,52 @@ public class SimpleDhtProvider extends ContentProvider {
                     BufferedReader bufferedReader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
                     String receivedMessage = bufferedReader.readLine();
                     if (Util.getMessageType(receivedMessage) == Util.MessageType.MESSAGE_TYPE_JOIN_CHORD_ACK) {
+                        bufferedReader.close();
+                        printWriter.close();
+                        socket.close();
+                    }
+                } catch (SocketException e) {
+                    e.printStackTrace();
+                } catch (SocketTimeoutException e) {
+                    e.printStackTrace();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            } else if (messageType.equals(Util.MessageType.MESSAGE_TYPE_JOIN_CHORD_SUCCESS)) {
+                Log.d(TAG, "Sending JOIN_CHORD_SUCCESS to requesting node for joining the DHT.");
+                Socket socket;
+                PrintWriter printWriter;
+
+                try {
+                    socket = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}), Integer.valueOf(recipient));
+                    printWriter = new PrintWriter(socket.getOutputStream(), true);
+                    printWriter.println(message);
+                    BufferedReader bufferedReader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+                    String receivedMessage = bufferedReader.readLine();
+                    if (Util.getMessageType(receivedMessage) == Util.MessageType.MESSAGE_TYPE_JOIN_CHORD_SUCCESS_ACK) {
+                        bufferedReader.close();
+                        printWriter.close();
+                        socket.close();
+                    }
+                } catch (SocketException e) {
+                    e.printStackTrace();
+                } catch (SocketTimeoutException e) {
+                    e.printStackTrace();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            } else if (messageType.equals(Util.MessageType.MESSAGE_TYPE_PREDECESSOR_UPDATE)) {
+                Log.d(TAG, "Sending PREDECESSOR_UPDATE to prior predecessor node.");
+                Socket socket;
+                PrintWriter printWriter;
+
+                try {
+                    socket = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}), Integer.valueOf(recipient));
+                    printWriter = new PrintWriter(socket.getOutputStream(), true);
+                    printWriter.println(message);
+                    BufferedReader bufferedReader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+                    String receivedMessage = bufferedReader.readLine();
+                    if (Util.getMessageType(receivedMessage) == Util.MessageType.MESSAGE_TYPE_PREDECESSOR_UPDATE_ACK) {
                         bufferedReader.close();
                         printWriter.close();
                         socket.close();
@@ -243,8 +321,17 @@ public class SimpleDhtProvider extends ContentProvider {
                             printWriter.close();
                             bufferedReader.close();
                             incomingSocket.close();
-                            if (shouldNodeBeAddedAsSuccessor(requestingPortHash)) {
+                            if (shouldNodeBeAddedAsPredecessor(requestingPortHash)) {
+                                String priorPredecessorPort = PREDECESSOR_NODE;
+                                String priorPredecessorPortHash = PREDECESSOR_NODE_HASH;
+                                String priorSuccessorPort = SUCCESSOR_NODE;
+                                String priorSuccessorPortHash = SUCCESSOR_NODE_HASH;
                                 processIncomingJoinChordMessage(requestingPort, requestingPortHash);
+                                informRequestingPortOfSuccess(requestingPort, priorPredecessorPort, CURRENT_NODE);
+                                if (priorSuccessorPort.equals(SUCCESSOR_NODE)) {
+                                    informPriorPredecessorPortOfUpdate(priorPredecessorPort, requestingPort);
+                                }
+
                             } else {
                                 forwardJoinPortRequest(receivedMessage);
                             }
@@ -257,32 +344,30 @@ public class SimpleDhtProvider extends ContentProvider {
     }
 
     public static void processIncomingJoinChordMessage(String requestingPort, String requestingPortHash) {
-
-        if (CURRENT_NODE.equals(MASTER_NODE)) {
-            if (PREDECESSOR_NODE.equals(CURRENT_NODE) && SUCCESSOR_NODE.equals(CURRENT_NODE)) {
-                // First node is requesting.
-                PREDECESSOR_NODE = requestingPort;
-                PREDECESSOR_NODE_HASH = requestingPortHash;
-                SUCCESSOR_NODE = requestingPort;
-                SUCCESSOR_NODE_HASH = requestingPortHash;
-            }
-
+        if (PREDECESSOR_NODE.equals(CURRENT_NODE) && SUCCESSOR_NODE.equals(CURRENT_NODE)) {
+            // First node is requesting.
+            PREDECESSOR_NODE = requestingPort;
+            PREDECESSOR_NODE_HASH = requestingPortHash;
+            SUCCESSOR_NODE = requestingPort;
+            SUCCESSOR_NODE_HASH = requestingPortHash;
+        } else {
+            PREDECESSOR_NODE = requestingPort;
+            PREDECESSOR_NODE_HASH = requestingPortHash;
         }
-//        if (genHash(requestingPort).compareTo(genHash()))
     }
 
-    public static boolean shouldNodeBeAddedAsSuccessor(String requestingPortHash) {
+    public static boolean shouldNodeBeAddedAsPredecessor(String requestingPortHash) {
         if (requestingPortHash.compareTo(PREDECESSOR_NODE_HASH) > 0 && requestingPortHash.compareTo(CURRENT_NODE) < 0) {
             // This requesting port must be added as predecessor.
             return true;
-        } else if (requestingPortHash.compareTo(PREDECESSOR_NODE_HASH) > 0 && requestingPortHash.compareTo(CURRENT_NODE) > 0) {
+        } else if (requestingPortHash.compareTo(PREDECESSOR_NODE_HASH) > 0 && requestingPortHash.compareTo(CURRENT_NODE_HASH) > 0) {
             if (PREDECESSOR_NODE_HASH.compareTo(CURRENT_NODE_HASH) > 0) {
                 return true;
             } else {
                 return false;
             }
-        } else if (requestingPortHash.compareTo(PREDECESSOR_NODE_HASH) < 0 && requestingPortHash.compareTo(CURRENT_NODE) < 0) {
-            if (PREDECESSOR_NODE_HASH.compareTo(CURRENT_NODE_HASH) < 0) {
+        } else if (requestingPortHash.compareTo(PREDECESSOR_NODE_HASH) < 0 && requestingPortHash.compareTo(CURRENT_NODE_HASH) < 0) {
+            if (PREDECESSOR_NODE_HASH.compareTo(CURRENT_NODE_HASH) > 0) {
                 return true;
             } else {
                 return false;
